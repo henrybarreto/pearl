@@ -2,138 +2,176 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt::{Debug, Display},
-    io::Read,
-    net::TcpStream,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
-use log::{debug, error, info, trace};
-use serde_json::Value;
-use ssh::{
-    server::{Auth, Handler},
-    Channel, ChannelId,
-};
-
-use ssh::{
-    server::{Msg, Session},
-    CryptoVec,
-};
-
-use ssh_key::rand_core::OsRng;
+use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+    net::TcpStream,
     sync::Mutex,
     task, time,
 };
 
-use websocket::{
-    client::IntoClientRequest, protocol::WebSocketConfig, stream::MaybeTlsStream, Bytes, Message,
-    WebSocket,
+use log::{debug, error, info, trace};
+
+use ssh::{
+    server::{Auth, Handler, Msg, Session},
+    Channel, ChannelId, CryptoVec, MethodSet,
 };
+
+use ssh_key::rand_core::OsRng;
+
+use websocket::{
+    client::IntoClientRequest,
+    protocol::{
+        frame::{
+            coding::{Data, OpCode},
+            Frame,
+        },
+        WebSocketConfig,
+    },
+    Bytes, Message,
+};
+
+use websocket_async::{MaybeTlsStream, WebSocketStream};
 
 mod errors;
 
+/// It is an adapter to convert websocket connection's messages into SSH packets to the SSH stream.
+///
+/// Essentially, it reads data from websocket, remove from the Message's packet and put back to the
+/// SSH stream. It also does the same when the data goes out the SSH server, wrapping it into a
+/// websocket binary message. Check the implementation for more details.
 struct WebSocketToSSHStream {
-    pub stream: WebSocket<MaybeTlsStream<TcpStream>>,
-    pub buffer: Option<Bytes>,
+    /// Internal websocket stream.
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// Internal buffer to the remaining bytes of an SSH packet after reading the packet size.
+    buffer: Option<Bytes>,
 }
 
-const SSH_PACKET_SIZE: usize = 4;
+impl WebSocketToSSHStream {
+    pub fn new(stream: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        return WebSocketToSSHStream {
+            stream,
+            buffer: None,
+        };
+    }
+}
 
 impl AsyncRead for WebSocketToSSHStream {
     fn poll_read(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        trace!("reading from websocket to ssh");
+    ) -> Poll<io::Result<()>> {
+        trace!("poll_read called on websocket to ssh adapter");
 
-        let this = &mut self.get_mut();
-
-        if let Some(buffer) = this.buffer.take() {
+        // NOTE: It checks if there is a pending buffer to be written. If it does, remove the
+        // buffer from structure, letting `None` on its place, and write it to SSH stream. Normally
+        // it is called after the SSH packet size reading, to read the content of the packet.
+        if let Some(buffer) = self.buffer.take() {
             trace!("there is some data on buffer to be read to SSH");
 
-            buf.put_slice(&buffer[SSH_PACKET_SIZE..]);
+            dbg!(&buf.remaining());
+            dbg!(&buffer);
+
+            buf.put_slice(&buffer);
 
             return Poll::Ready(Ok(()));
         }
 
-        if !this.stream.can_read() {
-            trace!("cannot read the websocket now");
+        return match self.stream.poll_next_unpin(cx) {
+            Poll::Ready(option) => {
+                trace!("poll ready on websocket read");
 
-            return Poll::Pending;
-        }
+                // TODO: Remove `unwrap` calls.
+                let p = option.unwrap();
+                let msg = p.unwrap();
 
-        let msg = this.stream.read();
-        match msg {
-            Ok(message) => match message {
-                Message::Binary(data) => {
-                    // NOTE: SSH's crate first reads 4 bytes, the size of the package, before read
-                    // the whole packet. We notice this by reading remaining method from reading
-                    // buffer.
-                    if buf.remaining() == SSH_PACKET_SIZE {
-                        trace!("SSH read specs package size");
+                match msg {
+                    Message::Binary(buffer) => {
+                        // NOTE: The SSH crate that we're using, cannot deal with a full WebSocket
+                        // binary packet at once because it first reads four bytes, the SSH packet size,
+                        // and, after that, the remaining, the size read. To address this issue, we
+                        // check if the space on the buffer is less than the data inside the
+                        // message, sending only the required piece and storing the remaining to
+                        // the next read in a buffer on the adapter structure.
+                        if buf.remaining() < buffer.len() {
+                            // WARN: The `remaining` is a variable because after put the data into
+                            // the slice, its value goes to zero, messing up with the remaining
+                            // part put on structure's buffer.
+                            let remaining = buf.remaining();
 
-                        debug!("read the SSH size package from websocket");
-                        buf.put_slice(&data[..SSH_PACKET_SIZE]);
+                            dbg!(remaining);
+                            dbg!(String::from_utf8_lossy(&buffer[..remaining]));
 
-                        // NOTE: Put the remaining bytes in a buffer for futher reading.
-                        this.buffer = Some(data);
-                    } else {
-                        debug!("read the SSH package to webscoket");
+                            buf.put_slice(&buffer[..remaining]);
 
-                        buf.put_slice(&data);
+                            self.buffer = Some(buffer.slice(remaining..));
+                        } else {
+                            buf.put_slice(&buffer);
+                        }
                     }
-
-                    return Poll::Ready(Ok(()));
+                    // TODO: Deal better with all cases of messages.
+                    Message::Close(e) => {
+                        println!("{:?}", e.unwrap());
+                    }
+                    _ => panic!("other message than binary"),
                 }
-                Message::Close(_) => return Poll::Ready(Ok(())),
-                _ => return Poll::Ready(Ok(())),
-            },
-            Err(e) => {
-                dbg!(&e);
 
-                return Poll::Pending;
+                Poll::Ready(Ok(()))
             }
-        }
+            Poll::Pending => {
+                trace!("poll pending on websocket read");
+
+                Poll::Pending
+            }
+        };
     }
 }
 
 impl AsyncWrite for WebSocketToSSHStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         trace!("WRITE");
 
-        // from SSH to WEBSOCKET
+        let mut frame = Frame::message(buf.to_vec(), OpCode::Data(Data::Binary), true);
+        // WARN: Avoid "bad mask" error when creating the frame.
+        // TODO: Create the mask the right way.
+        frame.header_mut().mask = Some([1, 2, 3, 4]);
 
-        let this = &mut self.get_mut();
+        let mut serialized = Vec::new();
 
-        if !this.stream.can_write() {
-            return Poll::Pending;
-        }
+        // NOTE: After creating the frame, we put it into a slice to be written into the websocket
+        // connection.
+        frame.format(&mut serialized).unwrap();
 
-        let inner = &mut this.stream;
+        // NOTE: After converting the SSH packet into a websocket frame, we write it to the
+        // websocket connection, confirming the size of the SSH packet to caller, not what was
+        // written on websocket connection, as it greater than the SSH packet.
+        return match Pin::new(&mut self.get_mut().stream.get_mut()).poll_write(cx, &serialized) {
+            Poll::Ready(_) => Poll::Ready(Ok(buf.len())),
+            Poll::Pending => {
+                trace!("poll pending on websocket write");
 
-        dbg!(String::from_utf8_lossy(buf));
-
-        let message = Message::binary(buf.to_vec()); // Properly frame it as a websocket binary message
-        let _ = inner.send(message).unwrap(); // Use write_message instead of write
-
-        return Poll::Ready(Ok(buf.len()));
+                Poll::Pending
+            }
+        };
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         trace!("FLUSH");
 
-        // Pin::new(&mut self.get_mut().inner.get_mut()).poll_flush(cx)
-        return Poll::Ready(Ok(()));
+        Pin::new(&mut self.get_mut().stream.get_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(
@@ -142,30 +180,12 @@ impl AsyncWrite for WebSocketToSSHStream {
     ) -> Poll<Result<(), std::io::Error>> {
         trace!("SHUTDOWN");
 
-        return Poll::Ready(Ok(()));
-        // Pin::new(&mut self.get_mut().inner.get_mut()).poll_shutdown(cx)
+        Pin::new(&mut self.get_mut().stream.get_mut()).poll_shutdown(cx)
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum TunnelErrors {}
-
-impl Display for TunnelErrors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!();
-        // self.message.fmt(f)
-    }
-}
-
-impl Error for TunnelErrors {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
-    }
-
-    fn cause(&self) -> Option<&dyn Error> {
-        self.source()
-    }
-}
 
 #[derive(Debug, Clone)]
 /// Commands are types of control messages used inside the Tunnel's commands.
@@ -174,6 +194,7 @@ pub enum Commands {
     ConnReady,
     /// keep-alive control message's type.
     KeepAlive,
+    /// Unknown control message.
     Unknown,
 }
 
@@ -238,6 +259,14 @@ pub struct Tunnel {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Control {
+    #[serde(rename = "command")]
+    pub command: String,
+    #[serde(rename = "connPath")]
+    pub conn_path: String,
+}
+
 // TODO: Implement Default
 impl Tunnel {
     pub fn new() -> Self {
@@ -270,133 +299,150 @@ impl Tunnel {
     }
 
     /// Listens for the incoming SSH connections coming from WebSocket connection.
-    pub async fn listen(&self) -> Result<(), impl Error> {
-        let handler = MyHandler {
+    pub async fn listen(&self, token: String) {
+        let handler = SSHHandler {
             clients: Arc::new(Mutex::new(HashMap::new())),
             id: 0,
         };
 
-        // let (mut stream, _) = websocket_async::connect_async("ws://127.0.0.1:80/ssh/connection")
-        let (mut stream, _) = websocket_async::connect_async(format!(
+        let mut request = format!(
             "{}://{}:{}/ssh/connection",
             self.scheme, self.host, self.port
-        ))
-        .await
+        )
+        .into_client_request()
         .unwrap();
 
-        let mut buffer = [0u8; 1024];
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+
+        let (mut stream, _) = websocket_async::connect_async(request).await.unwrap();
 
         loop {
-            let handler = handler.clone();
-
             trace!("looping");
 
-            let read = stream.get_mut().read(&mut buffer).await.unwrap();
-            let b = &buffer[2..read - 1];
+            while let Some(data) = stream.next().await {
+                let handler = handler.clone();
 
-            let command_str = String::from_utf8_lossy(b);
+                let msg = data.unwrap();
+                dbg!(&msg);
 
-            debug!("all command: {:?}", command_str);
-            let parts: Vec<&str> = command_str.split("\n").map(|v| v).collect();
+                match msg {
+                    Message::Binary(bytes) => {
+                        if let Ok(control) = serde_json::from_slice::<Control>(&bytes) {
+                            match Commands::from(control.command) {
+                                Commands::ConnReady => {
+                                    let tunnel = self.clone();
 
-            debug!("first command: {:?}", parts[0]);
+                                    task::spawn(async move {
+                                        let conn_path = control.conn_path;
+                                        info!("Connection ready on path: {}", conn_path);
 
-            if let Ok(json) = serde_json::from_str::<Value>(parts[0]) {
-                trace!("converted");
-                dbg!(&json);
+                                        let request = format!(
+                                            "{}://{}:{}{}",
+                                            tunnel.scheme, tunnel.host, tunnel.port, conn_path
+                                        )
+                                        .into_client_request()
+                                        .unwrap();
 
-                match Commands::from(json["command"].clone()) {
-                    Commands::ConnReady => {
-                        let tunnel = self.clone();
-                        task::spawn(async move {
-                            let conn_path = json["connPath"].as_str().unwrap_or_default();
-                            info!("Connection ready on path: {}", conn_path);
+                                        let websocket_config = Some(WebSocketConfig::default());
 
-                            let request = format!(
-                                "{}://{}:{}{}",
-                                tunnel.scheme, tunnel.host, tunnel.port, conn_path
-                            )
-                            .into_client_request()
-                            .unwrap();
+                                        let (stream, _) =
+                                            websocket_async::connect_async_with_config(
+                                                request,
+                                                websocket_config,
+                                                true,
+                                            )
+                                            .await
+                                            .unwrap();
 
-                            let websocket_config = Some(WebSocketConfig::default());
+                                        // NOTE: Read the GET request from websocket.
+                                        // /ssh/revdial?revdial.dialer=57df2c4e5200b17b6691eed26cd1229c&uuid=00000000-0000-4000-0000-000000000000
+                                        //
+                                        // let mut buffer = [0 as u8; 256];
+                                        // let read =
+                                        //     stream.get_mut().read(&mut buffer).await.unwrap();
 
-                            let (mut stream, _) = websocket::client::connect_with_config(
-                                request,
-                                websocket_config,
-                                8,
-                            )
-                            .unwrap();
+                                        // dbg!(String::from_utf8_lossy(&buffer[..read]));
 
-                            // NOTE: Read the GET request from websocket.
-                            // /ssh/revdial?revdial.dialer=57df2c4e5200b17b6691eed26cd1229c
+                                        let adapter_stream = WebSocketToSSHStream::new(stream);
 
-                            let mut buffer = [0 as u8; 256];
-                            let _ = stream.get_mut().read(&mut buffer).unwrap();
+                                        let config = ssh::server::Config {
+                                            inactivity_timeout: Some(time::Duration::from_secs(
+                                                3600,
+                                            )),
+                                            keys: vec![ssh::keys::PrivateKey::random(
+                                                &mut OsRng,
+                                                ssh::keys::Algorithm::Ed25519,
+                                            )
+                                            .unwrap()],
+                                            ..Default::default()
+                                        };
 
-                            debug!("{:?}", String::from_utf8_lossy(&buffer));
+                                        let config = Arc::new(config);
 
-                            let adpter_stream = WebSocketToSSHStream {
-                                stream,
-                                buffer: None,
-                            };
+                                        info!("session started");
 
-                            let config = ssh::server::Config {
-                                inactivity_timeout: Some(time::Duration::from_secs(3600)),
-                                keys: vec![ssh::keys::PrivateKey::random(
-                                    &mut OsRng,
-                                    ssh::keys::Algorithm::Ed25519,
-                                )
-                                .unwrap()],
-                                ..Default::default()
-                            };
+                                        let session = match ssh::server::run_stream(
+                                            config,
+                                            adapter_stream,
+                                            handler,
+                                        )
+                                        .await
+                                        {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                dbg!(e);
 
-                            let config = Arc::new(config);
+                                                debug!("Connection setup failed");
 
-                            info!("session started");
+                                                return;
+                                            }
+                                        };
 
-                            let session =
-                                match ssh::server::run_stream(config, adpter_stream, handler).await
-                                {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        dbg!(e);
+                                        match session.await {
+                                            Ok(_) => debug!("Connection closed"),
+                                            Err(e) => {
+                                                dbg!(e);
 
-                                        debug!("Connection setup failed");
+                                                debug!("Connection closed with error");
+                                            }
+                                        }
 
-                                        return;
-                                    }
-                                };
-
-                            match session.await {
-                                Ok(_) => debug!("Connection closed"),
-                                Err(e) => {
-                                    dbg!(e);
-
-                                    debug!("Connection closed with error");
+                                        info!("session done");
+                                    });
+                                }
+                                Commands::KeepAlive => {
+                                    info!("Received keep-alive");
+                                }
+                                Commands::Unknown => {
+                                    error!("Unknown command format");
                                 }
                             }
+                        } else {
+                            trace!("not JSON converted");
 
-                            info!("session done");
-                        });
+                            // return Err(errors::AgentError::new(
+                            //     // TODO: Change it.
+                            //     errors::AgentErrorKind::ErrorTunnel,
+                            //     "Error on tunnel".to_string(),
+                            // ));
+                        }
                     }
-                    Commands::KeepAlive => {
-                        info!("Received keep-alive");
+                    Message::Close(option) => {
+                        let frame = option.unwrap();
+
+                        error!("{:?}", frame);
                     }
-                    Commands::Unknown => {
-                        error!("Unknown command format");
+                    _ => {
+                        trace!("invalid message");
                     }
                 }
-            } else {
-                trace!("not converted");
 
-                return Err(errors::AgentError::new(
-                    // TODO: Change it.
-                    errors::AgentErrorKind::ErrorTunnel,
-                    "Error on tunnel".to_string(),
-                ));
+                continue;
             }
-        } // <---
+        }
     }
 }
 
@@ -404,6 +450,65 @@ impl Display for Tunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}://{}:{}", self.scheme, self.host, self.port)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceAuthRequest {
+    /// `info` is optional
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info: Option<DeviceInfo>,
+
+    /// omit if `None`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<String>>,
+
+    /// embed all fields from `DeviceAuth` at the same level
+    #[serde(flatten)]
+    pub device_auth: DeviceAuth,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceAuth {
+    /// hostname is optional if `identity` is present
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    /// identity is optional if `hostname` is present
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<DeviceIdentity>,
+
+    /// always required
+    #[serde(rename = "public_key")]
+    pub public_key: String,
+
+    /// always required
+    #[serde(rename = "tenant_id")]
+    pub tenant_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceAuthResponse {
+    pub uid: String,
+    pub token: String,
+    pub name: String,
+    pub namespace: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceIdentity {
+    pub mac: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub id: String,
+
+    #[serde(rename = "pretty_name")]
+    pub pretty_name: String,
+
+    pub version: String,
+    pub arch: String,
+    pub platform: String,
 }
 
 #[derive(Debug)]
@@ -419,6 +524,7 @@ pub struct Config {
 pub struct Agent {
     pub config: Config,
     pub tunnel: Tunnel,
+    pub token: Option<String>,
 }
 
 unsafe impl Sync for Agent {}
@@ -429,6 +535,7 @@ impl Agent {
         Agent {
             config,
             tunnel: Tunnel::new(),
+            token: None,
         }
     }
 
@@ -452,11 +559,64 @@ impl Agent {
         Ok(())
     }
 
-    fn authorize(&self) -> Result<(), &dyn Error> {
+    /*
+
+    type DeviceAuthRequest struct {
+        Info     *DeviceInfo `json:"info"`
+        Sessions []string    `json:"sessions,omitempty"`
+        *DeviceAuth
+    }
+
+    type DeviceAuthResponse struct {
+        UID       string `json:"uid"`
+        Token     string `json:"token"`
+        Name      string `json:"name"`
+        Namespace string `json:"namespace"`
+    }
+
+    */
+
+    async fn authorize(&mut self) -> Result<(), &dyn Error> {
+        // POST http://localhost/api/devices/auth
+
+        let req = DeviceAuthRequest {
+            info: Some(DeviceInfo {
+                id: "device-1234".into(),
+                pretty_name: "Thermostat Living Room".into(),
+                version: "1.2.0".into(),
+                arch: "armv7".into(),
+                platform: "linux".into(),
+            }),
+            sessions: None,
+            device_auth: DeviceAuth {
+                hostname: None,
+                identity: Some(DeviceIdentity { mac: "123".into() }),
+                public_key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...".into(),
+                tenant_id: "00000000-0000-4000-0000-000000000000".into(),
+            },
+        };
+
+        let client = http::Client::new();
+        let resp = client
+            .post("http://localhost/api/devices/auth")
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+
+        dbg!(resp.status());
+        if !resp.status().is_success() {}
+
+        let auth_data: DeviceAuthResponse = resp.json().await.unwrap();
+
+        self.token = Some(auth_data.token.clone());
+
+        dbg!(auth_data);
+
         Ok(())
     }
 
-    pub fn init(&self) -> Result<(), errors::AgentError> {
+    pub async fn init(&mut self) -> Result<(), errors::AgentError> {
         info!("Initializing...");
 
         if let Err(_) = self.generate_device_identity() {
@@ -504,7 +664,7 @@ impl Agent {
             ));
         }
 
-        if let Err(_) = self.authorize() {
+        if let Err(_) = self.authorize().await {
             error!("Error authorizing device");
 
             return Err(errors::AgentError::new(
@@ -516,7 +676,7 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn listen(&self) -> Result<(), errors::AgentError> {
+    pub async fn listen(&mut self) -> Result<(), errors::AgentError> {
         /*let (lister_sender, lister_receiver) = std::sync::mpsc::channel::<bool>();
 
         let agent = self.clone();
@@ -547,19 +707,19 @@ impl Agent {
             info!("Connection closed");
         })?;*/
 
-        self.tunnel.listen().await.unwrap();
+        self.tunnel.listen(self.token.take().unwrap()).await;
 
         Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct MyHandler {
+pub struct SSHHandler {
     clients: Arc<Mutex<HashMap<usize, (ChannelId, ssh::server::Handle)>>>,
     id: usize,
 }
 
-impl MyHandler {
+impl SSHHandler {
     async fn post(&mut self, data: CryptoVec) {
         let mut clients = self.clients.lock().await;
         for (id, (channel, ref mut s)) in clients.iter_mut() {
@@ -571,7 +731,7 @@ impl MyHandler {
 }
 
 #[async_trait]
-impl Handler for MyHandler {
+impl Handler for SSHHandler {
     type Error = ssh::Error;
 
     async fn channel_open_session(
@@ -579,13 +739,35 @@ impl Handler for MyHandler {
         channel: Channel<Msg>,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        info!("Session opened");
+        trace!("channel open handler called");
 
-        {
-            let mut clients = self.clients.lock().await;
-            clients.insert(self.id, (channel.id(), session.handle()));
-        }
+        println!("{:?}", channel.id());
+
         Ok(true)
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    async fn channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     async fn shell_request(
@@ -593,18 +775,51 @@ impl Handler for MyHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        trace!("shell request handler called");
+
         session.request_success();
 
         Ok(())
     }
 
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        trace!("auth none was called");
+
         Ok(Auth::Accept)
     }
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        info!("auth password");
+        trace!("auth password called");
 
+        debug!("USER: {:?}", user);
+        debug!("PASSWORD: {:?}", password);
+
+        Ok(Auth::Accept)
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        public_key: &ssh_key::PublicKey,
+    ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
 
@@ -614,6 +829,8 @@ impl Handler for MyHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        debug!("data handler called");
+
         dbg!(data);
 
         if data == [3] {
@@ -625,6 +842,7 @@ impl Handler for MyHandler {
             String::from_utf8_lossy(data)
         ));
         self.post(data.clone()).await;
+
         session.data(channel, data);
 
         Ok(())
@@ -636,8 +854,8 @@ async fn main() {
     env_logger::Builder::from_env("LOG").init();
 
     info!("Starting ShellHub agent...");
-    let agent = Agent::new(Config {
-        tenant_id: "09db1455-c643-495e-9775-ff1633343448".to_string(),
+    let mut agent = Agent::new(Config {
+        tenant_id: "00000000-0000-4000-0000-000000000000".to_string(),
         server_address: "http://localhost:80".to_string(),
         private_key_path: "/tmp/shellhub".to_string(),
         hostname: None,
@@ -650,7 +868,7 @@ async fn main() {
     info!("Namespace tenant's : {}", agent.config.tenant_id);
 
     info!("Initializing agent...");
-    if let Err(_) = agent.init() {
+    if let Err(_) = agent.init().await {
         error!("Error initializing agent");
 
         return;

@@ -5,17 +5,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.38.0", features = ["full"] }
-websocket_async = { package = "tokio-tungstenite", version = "*" }
-websocket = { package = "tungstenite", version = "0.26.1" }
-ssh = { package = "russh", version = "0.49.2" }
 log = "0.4.20"
-anyhow = "1.0.86"
 env_logger = "0.11.6"
-async-trait = "0.1.85"
-serde_json = "1.0.135"
-serde = "1.0.217"
+
+tokio = { version = "1.38.0", features = ["full"] }
 futures = "0.3.31"
+async-trait = "0.1.85"
+
+serde = "1.0.217"
+serde_json = "1.0.135"
+
+websocket = { package = "tungstenite", version = "0.26.1" }
+websocket_async = { package = "tokio-tungstenite", version = "0.26.1" }
+
+http = { package = "reqwest", version = "0.12.15", features = ["json"] }
+ssh = { package = "russh", version = "0.49.2" }
 ssh-key = "0.6.7"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
