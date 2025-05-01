@@ -1,6 +1,6 @@
-![Logo](https://github.com/user-attachments/assets/08428542-4d0b-481b-ad76-6491e973d094)
+![logo](https://github.com/user-attachments/assets/31560841-5328-4f71-9f80-15b60e50e4df)
 
-Pearl is an experimental ShellHub agent implementation written in Rust.
+<p align="center">Pearl is an experimental ShellHub agent implementation written in Rust.</p>
 
 ## Getting Started
 
