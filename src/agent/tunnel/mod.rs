@@ -11,7 +11,7 @@ use std::{
 use futures::StreamExt;
 
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Mutex, task, time};
+use tokio::{io::AsyncReadExt, sync::Mutex, task, time};
 
 use log::{debug, error, info, trace};
 
@@ -20,7 +20,7 @@ use ssh_key::rand_core::OsRng;
 use websocket::{client::IntoClientRequest, protocol::WebSocketConfig, Message};
 
 use adapter::Adapter;
-use handler::SSHHandler;
+use handler::Handler;
 
 /// TUNNEL_ENDPOINT is the HTTP endpoint used to upgrade to the WebSocket connection that receives
 /// controls messages from ShellHub's server.
@@ -136,7 +136,7 @@ impl Tunnel {
 
     /// Listens for the incoming SSH connections coming from WebSocket connection.
     pub async fn listen(&self, token: String) {
-        let handler = SSHHandler {
+        let handler = Handler {
             clients: Arc::new(Mutex::new(HashMap::new())),
             id: 0,
         };
@@ -195,7 +195,7 @@ impl Tunnel {
 
                                         // NOTE: Read the GET request from websocket.
                                         // /ssh/revdial?revdial.dialer=57df2c4e5200b17b6691eed26cd1229c&uuid=00000000-0000-4000-0000-000000000000
-                                        //
+
                                         // let mut buffer = [0 as u8; 256];
                                         // let read =
                                         //     stream.get_mut().read(&mut buffer).await.unwrap();
@@ -258,12 +258,6 @@ impl Tunnel {
                             }
                         } else {
                             trace!("not JSON converted");
-
-                            // return Err(errors::AgentError::new(
-                            //     // TODO: Change it.
-                            //     errors::AgentErrorKind::ErrorTunnel,
-                            //     "Error on tunnel".to_string(),
-                            // ));
                         }
                     }
                     Message::Close(option) => {

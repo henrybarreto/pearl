@@ -6,18 +6,15 @@ use tokio::sync::Mutex;
 
 use log::{debug, trace};
 
-use ssh::{
-    server::{Auth, Handler, Msg, Session},
-    Channel, ChannelId, CryptoVec,
-};
+use ssh::{Channel, ChannelId, CryptoVec};
 
 #[derive(Debug, Clone)]
-pub struct SSHHandler {
+pub struct Handler {
     pub clients: Arc<Mutex<HashMap<usize, (ChannelId, ssh::server::Handle)>>>,
     pub id: usize,
 }
 
-impl SSHHandler {
+impl Handler {
     async fn post(&mut self, data: CryptoVec) {
         let mut clients = self.clients.lock().await;
         for (id, (channel, ref mut s)) in clients.iter_mut() {
@@ -29,41 +26,43 @@ impl SSHHandler {
 }
 
 #[async_trait]
-impl Handler for SSHHandler {
+impl ssh::server::Handler for Handler {
     type Error = ssh::Error;
 
     async fn channel_open_session(
         &mut self,
-        channel: Channel<Msg>,
-        session: &mut Session,
+        channel: Channel<ssh::server::Msg>,
+        session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
         trace!("channel open handler called");
 
         println!("{:?}", channel.id());
+
+        session.channel_success(channel.id()).unwrap();
 
         Ok(true)
     }
 
     async fn channel_open_direct_tcpip(
         &mut self,
-        channel: Channel<Msg>,
+        channel: Channel<ssh::server::Msg>,
         host_to_connect: &str,
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
-        session: &mut Session,
+        session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
 
     async fn channel_open_forwarded_tcpip(
         &mut self,
-        channel: Channel<Msg>,
+        channel: Channel<ssh::server::Msg>,
         host_to_connect: &str,
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
-        session: &mut Session,
+        session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
@@ -71,7 +70,7 @@ impl Handler for SSHHandler {
     async fn shell_request(
         &mut self,
         channel: ChannelId,
-        session: &mut Session,
+        session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
         trace!("shell request handler called");
 
@@ -84,7 +83,7 @@ impl Handler for SSHHandler {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -93,41 +92,47 @@ impl Handler for SSHHandler {
         &mut self,
         channel: ChannelId,
         name: &str,
-        session: &mut Session,
+        session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+    async fn auth_none(&mut self, user: &str) -> Result<ssh::server::Auth, Self::Error> {
         trace!("auth none was called");
 
-        Ok(Auth::Accept)
+        debug!("USER: {:?}", user);
+
+        Ok(ssh::server::Auth::Accept)
     }
 
-    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+    async fn auth_password(
+        &mut self,
+        user: &str,
+        password: &str,
+    ) -> Result<ssh::server::Auth, Self::Error> {
         trace!("auth password called");
 
         debug!("USER: {:?}", user);
         debug!("PASSWORD: {:?}", password);
 
-        Ok(Auth::Accept)
+        Ok(ssh::server::Auth::Accept)
     }
 
     async fn auth_publickey(
         &mut self,
         user: &str,
         public_key: &ssh_key::PublicKey,
-    ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+    ) -> Result<ssh::server::Auth, Self::Error> {
+        Ok(ssh::server::Auth::Accept)
     }
 
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
-        debug!("data handler called");
+        trace!("data handler called");
 
         dbg!(data);
 
@@ -139,9 +144,10 @@ impl Handler for SSHHandler {
             "Olá, pessoal, eu sou o Agent em Rust!: {}\r\n",
             String::from_utf8_lossy(data)
         ));
-        self.post(data.clone()).await;
 
-        session.data(channel, data);
+        // self.post(data.clone()).await;
+
+        session.data(channel, data).unwrap();
 
         Ok(())
     }
