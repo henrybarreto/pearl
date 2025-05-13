@@ -1,5 +1,4 @@
 pub mod agent;
-pub mod errors;
 
 use agent::{config::Config, Agent};
 use log::{error, info};
@@ -17,14 +16,17 @@ async fn main() {
         identity: None,
     });
 
-    info!("ShellHub Peal Agent version: {}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "ShellHub Pearl Agent version: {}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     info!("Server address: {}", agent.config.server_address);
     info!("Namespace tenant's : {}", agent.config.tenant_id);
 
     info!("Initializing agent...");
-    if let Err(_) = agent.init().await {
-        error!("Error initializing agent");
+    if let Err(e) = agent.init().await {
+        error!("Error initializing agent: {}", e);
 
         return;
     }
@@ -32,8 +34,11 @@ async fn main() {
     info!("Agent initialized");
 
     info!("Listening to agent...");
-    if let Err(_) = agent.listen().await {
-        error!("Error listening to agent");
+    // TODO: If agent's listening fails due to authentication expiration, network problems or
+    // server is down, we should retry after a reauthentication or after a while. If the error is
+    // not recoverable, we should exit the program.
+    if let Err(error) = agent.listen().await {
+        error!("Error listening to agent: {}", error);
 
         return;
     }

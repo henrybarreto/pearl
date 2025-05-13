@@ -1,81 +1,23 @@
+pub mod api;
 pub mod config;
+pub mod errors;
 pub mod tunnel;
 
-use std::{error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug, time::Duration};
 
+use api::API;
 use config::Config;
-
-use serde::{Deserialize, Serialize};
 
 use log::{error, info};
 
+use tokio::time::sleep;
 use tunnel::Tunnel;
-
-use crate::errors;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceAuthRequest {
-    /// `info` is optional
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub info: Option<DeviceInfo>,
-
-    /// omit if `None`
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sessions: Option<Vec<String>>,
-
-    /// embed all fields from `DeviceAuth` at the same level
-    #[serde(flatten)]
-    pub device_auth: DeviceAuth,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceIdentity {
-    pub mac: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceInfo {
-    pub id: String,
-
-    #[serde(rename = "pretty_name")]
-    pub pretty_name: String,
-
-    pub version: String,
-    pub arch: String,
-    pub platform: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceAuthResponse {
-    pub uid: String,
-    pub token: String,
-    pub name: String,
-    pub namespace: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceAuth {
-    /// hostname is optional if `identity` is present
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-
-    /// identity is optional if `hostname` is present
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identity: Option<DeviceIdentity>,
-
-    /// always required
-    #[serde(rename = "public_key")]
-    pub public_key: String,
-
-    /// always required
-    #[serde(rename = "tenant_id")]
-    pub tenant_id: String,
-}
 
 #[derive(Debug)]
 pub struct Agent {
     pub config: Config,
     pub tunnel: Tunnel,
+    pub api: API,
     pub token: Option<String>,
 }
 
@@ -87,6 +29,7 @@ impl Agent {
         Agent {
             config,
             tunnel: Tunnel::new(),
+            api: API::new(),
             token: None,
         }
     }
@@ -111,42 +54,61 @@ impl Agent {
         Ok(())
     }
 
-    async fn authorize(&mut self) -> Result<(), &dyn Error> {
-        // POST http://localhost/api/devices/auth
-
-        let req = DeviceAuthRequest {
-            info: Some(DeviceInfo {
+    async fn authorize(&mut self) -> Result<(), errors::AgentError> {
+        let req = api::DeviceAuthRequest {
+            info: Some(api::DeviceInfo {
                 id: "device-1234".into(),
-                pretty_name: "Thermostat Living Room".into(),
+                pretty_name: "Thermostat".into(),
                 version: "1.2.0".into(),
                 arch: "armv7".into(),
                 platform: "linux".into(),
             }),
             sessions: None,
-            device_auth: DeviceAuth {
+            device_auth: api::DeviceAuth {
                 hostname: None,
-                identity: Some(DeviceIdentity { mac: "123".into() }),
+                identity: api::DeviceIdentity {
+                    mac: "AA:BB:CC:DD:EE:FF".into(),
+                },
                 public_key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...".into(),
                 tenant_id: "00000000-0000-4000-0000-000000000000".into(),
             },
         };
 
-        let client = http::Client::new();
-        let resp = client
-            .post("http://localhost/api/devices/auth")
-            .json(&req)
-            .send()
-            .await
-            .unwrap();
+        let auth_data: api::DeviceAuthResponse = match self.api.authenticate(req).await {
+            Ok(auth_data) => auth_data,
+            Err(error) => match error.code {
+                Some(code) => match code {
+                    401 => {
+                        return Err(errors::AgentError::new(
+                            errors::AgentErrorKind::ErrorUnauthorized,
+                            format!("Unauthorized: {}", error),
+                            // NOTE: This error is not fatal, because we can retry the
+                            // authorization process.
+                        ));
+                    }
+                    403 => {
+                        return Err(errors::AgentError::new(
+                            errors::AgentErrorKind::ErrorForbidden,
+                            format!("Forbidden: {}", error),
+                        ));
+                    }
+                    _ => {
+                        return Err(errors::AgentError::new(
+                            errors::AgentErrorKind::ErrorUnknown,
+                            format!("Unknown error: {}", error),
+                        ));
+                    }
+                },
+                None => {
+                    return Err(errors::AgentError::new(
+                        errors::AgentErrorKind::ErrorAuthorize,
+                        format!("Error authorizing device: {}", error),
+                    ));
+                }
+            },
+        };
 
-        dbg!(resp.status());
-        if !resp.status().is_success() {}
-
-        let auth_data: DeviceAuthResponse = resp.json().await.unwrap();
-
-        self.token = Some(auth_data.token.clone());
-
-        dbg!(auth_data);
+        self.token = Some(auth_data.token);
 
         Ok(())
     }
@@ -199,12 +161,12 @@ impl Agent {
             ));
         }
 
-        if let Err(_) = self.authorize().await {
+        if let Err(e) = self.authorize().await {
             error!("Error authorizing device");
 
             return Err(errors::AgentError::new(
                 errors::AgentErrorKind::ErrorAuthorize,
-                "Error authorizing device".to_string(),
+                format!("Error authorizing device: {}", e),
             ));
         }
 
@@ -242,7 +204,52 @@ impl Agent {
             info!("Connection closed");
         })?;*/
 
-        self.tunnel.listen(self.token.take().unwrap()).await;
+        loop {
+            info!("Listening to agent...");
+
+            if self.token.is_none() {
+                error!("Token is None");
+
+                if let Err(e) = self.authorize().await {
+                    match e.kind {
+                        errors::AgentErrorKind::ErrorUnauthorized => {
+                            error!("Unauthorized: {}", e);
+
+                            info!("Retrying authorization...");
+
+                            // NOTE: Wait 10 seconds before retrying authentication.
+                            sleep(Duration::from_secs(10)).await;
+
+                            continue;
+                        }
+                        errors::AgentErrorKind::ErrorForbidden => {
+                            error!("Forbidden: {}", e);
+
+                            break;
+                        }
+                        _ => {
+                            error!("Unknown error: {}", e);
+
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let token = self.token.take().unwrap();
+
+            if let Err(error) = self.tunnel.listen(token).await {
+                if !error.fatal {
+                    info!("Retrying connection to server...");
+
+                    continue;
+                }
+
+                error!("Error listening to agent: {}", error);
+
+                break;
+            }
+        }
 
         Ok(())
     }

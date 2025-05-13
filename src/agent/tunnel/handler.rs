@@ -6,24 +6,12 @@ use tokio::sync::Mutex;
 
 use log::{debug, trace};
 
-use ssh::{Channel, ChannelId, CryptoVec};
+use ssh::{keys::ssh_encoding::Encode, Channel, ChannelId, CryptoVec};
 
 #[derive(Debug, Clone)]
-pub struct Handler {
-    pub clients: Arc<Mutex<HashMap<usize, (ChannelId, ssh::server::Handle)>>>,
-    pub id: usize,
-}
+pub struct Handler {}
 
-impl Handler {
-    async fn post(&mut self, data: CryptoVec) {
-        let mut clients = self.clients.lock().await;
-        for (id, (channel, ref mut s)) in clients.iter_mut() {
-            if *id != self.id {
-                let _ = s.data(*channel, data.clone()).await;
-            }
-        }
-    }
-}
+impl Handler {}
 
 #[async_trait]
 impl ssh::server::Handler for Handler {
@@ -39,6 +27,7 @@ impl ssh::server::Handler for Handler {
         println!("{:?}", channel.id());
 
         session.channel_success(channel.id()).unwrap();
+        session.channel_open_session().unwrap();
 
         Ok(true)
     }
@@ -65,6 +54,20 @@ impl ssh::server::Handler for Handler {
         session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
         Ok(false)
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        modes: &[(ssh::Pty, u32)],
+        session: &mut ssh::server::Session,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     async fn shell_request(
@@ -133,8 +136,6 @@ impl ssh::server::Handler for Handler {
         session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
         trace!("data handler called");
-
-        dbg!(data);
 
         if data == [3] {
             return Err(ssh::Error::Disconnect);

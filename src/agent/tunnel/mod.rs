@@ -3,7 +3,7 @@ pub mod handler;
 
 use std::{
     collections::HashMap,
-    error::Error,
+    error::{self},
     fmt::{Debug, Display},
     sync::Arc,
 };
@@ -103,6 +103,38 @@ pub struct Control {
     pub conn_path: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Error {
+    pub message: String,
+    pub fatal: bool,
+}
+
+impl Error {
+    pub fn new(message: String, fatal: bool) -> Self {
+        Error { message, fatal }
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        None
+    }
+
+    fn description(&self) -> &str {
+        "description() is deprecated; use Display"
+    }
+
+    fn cause(&self) -> Option<&dyn error::Error> {
+        self.source()
+    }
+}
+
 // TODO: Implement Default
 impl Tunnel {
     pub fn new() -> Self {
@@ -116,30 +148,27 @@ impl Tunnel {
         }
     }
 
-    pub fn connect_handler(&self, callback: &dyn Fn()) -> Result<(), &dyn Error> {
+    pub fn connect_handler(&self, callback: &dyn Fn()) -> Result<(), Error> {
         callback();
 
         Ok(())
     }
 
-    pub fn keep_alive_handler(&self, callback: &dyn Fn()) -> Result<(), &dyn Error> {
+    pub fn keep_alive_handler(&self, callback: &dyn Fn()) -> Result<(), Error> {
         callback();
 
         Ok(())
     }
 
-    pub fn close_handler(&self, callback: &dyn Fn()) -> Result<(), &dyn Error> {
+    pub fn close_handler(&self, callback: &dyn Fn()) -> Result<(), Error> {
         callback();
 
         Ok(())
     }
 
     /// Listens for the incoming SSH connections coming from WebSocket connection.
-    pub async fn listen(&self, token: String) {
-        let handler = Handler {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            id: 0,
-        };
+    pub async fn listen(&self, token: String) -> Result<(), Error> {
+        let handler = Handler {};
 
         let mut request = format!(
             "{}://{}:{}/ssh/connection",
@@ -153,7 +182,21 @@ impl Tunnel {
             format!("Bearer {}", token).parse().unwrap(),
         );
 
-        let (mut stream, _) = websocket_async::connect_async(request).await.unwrap();
+        let (mut stream, _) = match websocket_async::connect_async(request).await {
+            Ok((stream, response)) => {
+                info!("Connected to server");
+
+                (stream, response)
+            }
+            Err(e) => {
+                error!("Error connecting to server: {}", e);
+
+                return Err(Error::new(
+                    format!("Error connecting to server: {}", e),
+                    false,
+                ));
+            }
+        };
 
         loop {
             trace!("looping");
@@ -162,7 +205,6 @@ impl Tunnel {
                 let handler = handler.clone();
 
                 let msg = data.unwrap();
-                dbg!(&msg);
 
                 match msg {
                     Message::Binary(bytes) => {
@@ -173,7 +215,7 @@ impl Tunnel {
 
                                     task::spawn(async move {
                                         let conn_path = control.conn_path;
-                                        info!("Connection ready on path: {}", conn_path);
+                                        debug!("Connection ready on path: {}", conn_path);
 
                                         let request = format!(
                                             "{}://{}:{}{}",
@@ -200,7 +242,7 @@ impl Tunnel {
                                         // let read =
                                         //     stream.get_mut().read(&mut buffer).await.unwrap();
 
-                                        // dbg!(String::from_utf8_lossy(&buffer[..read]));
+                                        //
 
                                         let adapter_stream = Adapter::new(stream);
 
@@ -218,7 +260,7 @@ impl Tunnel {
 
                                         let config = Arc::new(config);
 
-                                        info!("session started");
+                                        debug!("session started");
 
                                         let session = match ssh::server::run_stream(
                                             config,
@@ -229,9 +271,7 @@ impl Tunnel {
                                         {
                                             Ok(s) => s,
                                             Err(e) => {
-                                                dbg!(e);
-
-                                                debug!("Connection setup failed");
+                                                debug!("Connection setup failed: {}", e);
 
                                                 return;
                                             }
@@ -240,9 +280,7 @@ impl Tunnel {
                                         match session.await {
                                             Ok(_) => debug!("Connection closed"),
                                             Err(e) => {
-                                                dbg!(e);
-
-                                                debug!("Connection closed with error");
+                                                debug!("Connection closed with error: {}", e);
                                             }
                                         }
 

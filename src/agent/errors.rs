@@ -10,12 +10,15 @@ pub enum AgentErrorKind {
     ErrorAuthorize,
     ErroServerStartOverWebSocket,
     ErrorTunnel,
+    ErrorUnauthorized,
+    ErrorForbidden,
+    ErrorUnknown,
 }
 
 #[derive(Debug, Clone)]
 pub struct AgentError {
-    kind: AgentErrorKind,
-    message: String,
+    pub kind: AgentErrorKind,
+    pub message: String,
 }
 
 impl AgentError {
