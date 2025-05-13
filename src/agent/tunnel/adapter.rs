@@ -10,7 +10,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use log::trace;
+use tracing::trace;
 
 use websocket::{
     protocol::frame::{
@@ -57,9 +57,6 @@ impl AsyncRead for Adapter {
         if let Some(buffer) = self.buffer.take() {
             trace!("there is some data on buffer to be read to SSH");
 
-            dbg!(&buf.remaining());
-            dbg!(&buffer);
-
             buf.put_slice(&buffer);
 
             return Poll::Ready(Ok(()));
@@ -86,9 +83,6 @@ impl AsyncRead for Adapter {
                             // the slice, its value goes to zero, messing up with the remaining
                             // part put on structure's buffer.
                             let remaining = buf.remaining();
-
-                            dbg!(remaining);
-                            dbg!(String::from_utf8_lossy(&buffer[..remaining]));
 
                             buf.put_slice(&buffer[..remaining]);
 
