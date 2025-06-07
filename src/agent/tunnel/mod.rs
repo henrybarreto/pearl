@@ -170,8 +170,6 @@ impl Tunnel {
     pub async fn listen(&self, token: String) -> Result<(), Error> {
         trace!("listen started");
 
-        let handler = Handler {};
-
         // NOTE: The self object, Tunnel, implements Display that generate the server full address
         // based on the information on the Tunnel.
         let mut request = format!("{}/ssh/connection", self)
@@ -205,8 +203,6 @@ impl Tunnel {
             trace!("looping");
 
             while let Some(data) = stream.next().await {
-                let handler = handler.clone();
-
                 let msg = match data {
                     Ok(m) => m,
                     Err(e) => {
@@ -276,6 +272,8 @@ impl Tunnel {
                                     let config = Arc::new(config);
 
                                     info!("session started");
+
+                                    let handler = Handler {};
 
                                     let session = match ssh::server::run_stream(
                                         config,
