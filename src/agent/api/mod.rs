@@ -2,6 +2,8 @@ use std::{error, fmt::Display};
 
 use serde::{Deserialize, Serialize};
 
+use super::config::{self, Identity};
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub id: String,
@@ -34,6 +36,12 @@ pub struct DeviceAuthRequest {
 pub struct DeviceIdentity {
     /// The MAC address of the network interface used to connect to the ShellHub server.
     pub mac: String,
+}
+
+impl From<config::Identity> for DeviceIdentity {
+    fn from(value: config::Identity) -> Self {
+        return DeviceIdentity { mac: value.mac };
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,7 +167,6 @@ impl API {
         }
 
         let auth_data: DeviceAuthResponse = resp.json().await.unwrap();
-        
 
         Ok(auth_data)
     }

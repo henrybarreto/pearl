@@ -1,6 +1,9 @@
 pub mod agent;
 
-use agent::{config::Config, Agent};
+use agent::{
+    config::{Config, Identity},
+    Agent,
+};
 
 use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
@@ -23,7 +26,9 @@ async fn main() {
         server_address: "http://localhost:80".to_string(),
         private_key_path: "/tmp/shellhub".to_string(),
         hostname: None,
-        identity: None,
+        identity: Identity {
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+        },
     });
 
     info!(

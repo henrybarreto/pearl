@@ -65,12 +65,10 @@ impl Agent {
             }),
             sessions: None,
             device_auth: api::DeviceAuth {
-                hostname: None,
-                identity: api::DeviceIdentity {
-                    mac: "aa:bb:cc:dd:ee:ff".into(),
-                },
+                hostname: self.config.hostname.clone(),
+                identity: self.config.identity.clone().into(),
                 public_key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...".into(),
-                tenant_id: "00000000-0000-4000-0000-000000000000".into(),
+                tenant_id: self.config.tenant_id.clone(),
             },
         };
 
