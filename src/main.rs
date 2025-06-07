@@ -2,22 +2,20 @@ pub mod agent;
 
 use agent::{config::Config, Agent};
 
-use tracing::{error, info, level_filters::LevelFilter, Level};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing::{error, info, level_filters::LevelFilter};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .with_env_var("LOG")
-        .from_env_lossy();
-
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_env_filter(filter)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_env_var("LOG")
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env()
+                .unwrap(),
+        )
+        .init();
 
     info!("Starting ShellHub agent...");
     let mut agent = Agent::new(Config {
