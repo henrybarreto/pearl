@@ -1,10 +1,11 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::fmt::Debug;
+use tokio::process::Command;
 
 use async_trait::async_trait;
 
-use tracing::{debug, trace};
-
 use ssh::{Channel, ChannelId, CryptoVec};
+
+use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
 pub struct Handler {}
@@ -20,11 +21,11 @@ impl ssh::server::Handler for Handler {
         channel: Channel<ssh::server::Msg>,
         session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
-        trace!("channel open handler called");
-
-        println!("{:?}", channel.id());
+        info!("channel open handler called");
 
         session.channel_success(channel.id()).unwrap();
+
+        println!("{:?}", channel.id());
 
         Ok(true)
     }
@@ -38,6 +39,8 @@ impl ssh::server::Handler for Handler {
         originator_port: u32,
         session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
+        info!("channel open direct tcpip handler called");
+
         Ok(false)
     }
 
@@ -50,6 +53,8 @@ impl ssh::server::Handler for Handler {
         originator_port: u32,
         session: &mut ssh::server::Session,
     ) -> Result<bool, Self::Error> {
+        info!("channel open forwarded handler called");
+
         Ok(false)
     }
 
@@ -64,7 +69,10 @@ impl ssh::server::Handler for Handler {
         modes: &[(ssh::Pty, u32)],
         session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
+        info!("pty request handler called");
+
+        session.channel_failure(channel)?;
+        session.close(channel)?;
 
         Ok(())
     }
@@ -74,9 +82,10 @@ impl ssh::server::Handler for Handler {
         channel: ChannelId,
         session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
-        trace!("shell request handler called");
+        info!("shell request handler called");
 
-        session.request_success();
+        session.channel_failure(channel)?;
+        session.close(channel)?;
 
         Ok(())
     }
@@ -87,9 +96,55 @@ impl ssh::server::Handler for Handler {
         data: &[u8],
         session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
-        trace!("exec request handler called");
+        info!("exec request handler called");
 
-        session.request_success();
+        session.channel_success(channel)?;
+
+        let command = String::from_utf8_lossy(data).to_string();
+        info!(command = command, "command to execute");
+
+        let command_parts: Vec<&str> = command.split(' ').collect();
+
+        let result_result = Command::new(command_parts[0])
+            .args(&command_parts[1..])
+            .output()
+            .await;
+
+        let result = match result_result {
+            Ok(result) => result,
+            Err(e) => {
+                error!(error = e.to_string(), "failed to execute the command");
+
+                let data = CryptoVec::from(e.to_string());
+                session.data(channel, data)?;
+                session.exit_status_request(channel, 1)?;
+
+                session.eof(channel)?;
+                session.close(channel)?;
+
+                return Ok(());
+            }
+        };
+
+        let mut stdout = result.stdout;
+        let mut stderr = result.stderr;
+
+        let mut output: Vec<u8> = Vec::new();
+        output.append(&mut stdout);
+        output.append(&mut stderr);
+
+        let status = result.status.code().unwrap();
+        info!(status = status, "command exit status");
+
+        let data = CryptoVec::from(output);
+        session.data(channel, data)?;
+
+        session.exit_status_request(channel, status as u32)?;
+
+        session.eof(channel)?;
+        session.close(channel)?;
+
+        info!("command executed with success");
 
         Ok(())
     }
@@ -100,13 +155,16 @@ impl ssh::server::Handler for Handler {
         name: &str,
         session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
+        info!("subsystem request handler called");
+
+        session.channel_failure(channel)?;
+        session.close(channel)?;
+
         Ok(())
     }
 
     async fn auth_none(&mut self, user: &str) -> Result<ssh::server::Auth, Self::Error> {
-        trace!("auth none was called");
-
-        debug!("USER: {:?}", user);
+        info!("auth none was called");
 
         Ok(ssh::server::Auth::Accept)
     }
@@ -116,7 +174,7 @@ impl ssh::server::Handler for Handler {
         user: &str,
         password: &str,
     ) -> Result<ssh::server::Auth, Self::Error> {
-        trace!("auth password called");
+        info!("auth password called");
 
         debug!("USER: {:?}", user);
         debug!("PASSWORD: {:?}", password);
@@ -129,6 +187,8 @@ impl ssh::server::Handler for Handler {
         user: &str,
         public_key: &ssh_key::PublicKey,
     ) -> Result<ssh::server::Auth, Self::Error> {
+        info!("auth publickey called");
+
         Ok(ssh::server::Auth::Accept)
     }
 
@@ -138,20 +198,22 @@ impl ssh::server::Handler for Handler {
         data: &[u8],
         session: &mut ssh::server::Session,
     ) -> Result<(), Self::Error> {
-        trace!("data handler called");
+        info!("data handler called");
 
-        if data == [3] {
-            return Err(ssh::Error::Disconnect);
-        }
+        session.eof(channel)?;
+        session.close(channel)?;
 
-        let data = CryptoVec::from(format!(
-            "Olá, pessoal, eu sou o Agent em Rust!: {}\r\n",
-            String::from_utf8_lossy(data)
-        ));
+        // if data == [3] {
+        //     return Err(ssh::Error::Disconnect);
+        // }
+
+        // let msg = format!("{}\r\n", String::from_utf8_lossy(data));
+        // let stdin = self.stdin.clone().unwrap();
+        // let data = CryptoVec::from();
 
         // self.post(data.clone()).await;
 
-        session.data(channel, data).unwrap();
+        // session.data(channel, data).unwrap();
 
         Ok(())
     }
